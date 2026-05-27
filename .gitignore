@@ -1,0 +1,6 @@
+.venv
+.vscode
+follow_person.py
+drone_terminal.py
+drone_terminal_control.py
+
