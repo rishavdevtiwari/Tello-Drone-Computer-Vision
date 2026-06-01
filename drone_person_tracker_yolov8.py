@@ -2,6 +2,7 @@
 #ultralytics YOLOv8 model to detect and track a person
 
 import cv2
+import sys
 import time
 from djitellopy import Tello
 from ultralytics import YOLO
@@ -39,7 +40,7 @@ class TelloPersonTracker:
         
         if self.tello.get_battery() < 15:
             print("Battery too low for safe flight. Exiting.")
-            exit()
+            sys.exit(1)
 
         self.tello.streamon()
         self.tello.takeoff()

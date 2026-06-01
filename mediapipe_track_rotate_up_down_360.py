@@ -1,6 +1,7 @@
 # MediaPipe Tasks API Person Tracker & Two-Phase 360 Search for DJI Tello
 
 import cv2
+import sys
 import time
 import urllib.request
 import os
@@ -26,7 +27,7 @@ class TelloPersonTracker:
                 print("Your computer likely has no internet connection because it is connected to the Tello drone.")
                 print("-> FIX: Disconnect from Tello, connect to your normal Wi-Fi, run this script once to download the file, then reconnect to the Tello.")
                 print("="*50 + "\n")
-                exit()
+                sys.exit(1)
 
         # 2. Initialize Drone
         self.tello = Tello()
@@ -66,10 +67,10 @@ class TelloPersonTracker:
         """Connects to the drone, starts the stream, and takes off."""
         self.tello.connect()
         print(f"Battery: {self.tello.get_battery()}%")
-        
+
         if self.tello.get_battery() < 15:
             print("Battery too low for safe flight. Exiting.")
-            exit()
+            sys.exit(1)
 
         self.tello.streamon()
         self.tello.takeoff()

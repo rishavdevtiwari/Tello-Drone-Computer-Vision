@@ -1,6 +1,7 @@
 # MediaPipe Person Tracker & Autonomous Square Patrol for DJI Tello Drone
 
 import cv2
+import sys
 import time
 from djitellopy import Tello
 import mediapipe as mp
@@ -49,10 +50,10 @@ class TelloPersonTracker:
         """Connects to the drone, starts the stream, and takes off."""
         self.tello.connect()
         print(f"Battery: {self.tello.get_battery()}%")
-        
+
         if self.tello.get_battery() < 15:
             print("Battery too low for safe flight. Exiting.")
-            exit()
+            sys.exit(1)
 
         self.tello.streamon()
         self.tello.takeoff()

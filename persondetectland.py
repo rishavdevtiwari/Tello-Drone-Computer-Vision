@@ -1,4 +1,5 @@
 import cv2
+import sys
 import time
 import os
 import urllib.request
@@ -17,7 +18,7 @@ if not os.path.exists(model_path):
         print("Download complete!")
     except:
         print("ERROR: Could not download. Disconnect from Tello, connect to normal Wi-Fi, run once, then reconnect to Tello.")
-        exit()
+        sys.exit(1)
 
 # 2. INITIALIZE MEDIAPIPE
 print("Loading Model...")
@@ -37,7 +38,7 @@ print(f"Battery: {tello.get_battery()}%")
 
 if tello.get_battery() < 10:
     print("Battery too low. Exiting.")
-    exit()
+    sys.exit(1)
 
 tello.streamon()
 tello.takeoff()

@@ -1,6 +1,7 @@
 # MediaPipe Tasks API Orbit Tracker for DJI Tello Drone
 
 import cv2
+import sys
 import time
 import urllib.request
 import os
@@ -26,7 +27,7 @@ class TelloPersonTracker:
                 print("   internet Wi-Fi, run this script once to download the file,")
                 print("   then reconnect to the Tello Wi-Fi and fly.")
                 print("="*60 + "\n")
-                exit()
+                sys.exit(1)
 
         # 2. Initialize Drone
         self.tello = Tello()
@@ -63,10 +64,10 @@ class TelloPersonTracker:
     def connect_and_takeoff(self):
         self.tello.connect()
         print(f"Battery: {self.tello.get_battery()}%")
-        
+
         if self.tello.get_battery() < 15:
             print("Battery too low for safe flight. Exiting.")
-            exit()
+            sys.exit(1)
 
         self.tello.streamon()
         self.tello.takeoff()
