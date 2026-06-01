@@ -1,44 +1,66 @@
-# MediaPipe Person Tracker for DJI Tello Drone
+# MediaPipe Tasks API Orbit Tracker for DJI Tello Drone
 
 import cv2
 import time
+import urllib.request
+import os
 from djitellopy import Tello
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 class TelloPersonTracker:
     def __init__(self):
-        # 1. Initialize Drone
+        # 1. Offline Model Download Handler
+        self.model_path = 'pose_landmarker_lite.task'
+        if not os.path.exists(self.model_path):
+            print(f"Model missing. Attempting to download {self.model_path}...")
+            try:
+                url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+                urllib.request.urlretrieve(url, self.model_path)
+                print("Download complete!")
+            except Exception as e:
+                print("\n" + "="*60)
+                print("[NETWORK ERROR] Could not download the MediaPipe model.")
+                print("-> FIX: Disconnect from the Tello Wi-Fi, connect to normal")
+                print("   internet Wi-Fi, run this script once to download the file,")
+                print("   then reconnect to the Tello Wi-Fi and fly.")
+                print("="*60 + "\n")
+                exit()
+
+        # 2. Initialize Drone
         self.tello = Tello()
         
-        # 2. Initialize MediaPipe Pose Model
-        print("Loading MediaPipe Pose model...")
-        self.mp_pose = mp.solutions.pose
-        # min_detection_confidence limits false positives
-        self.pose = self.mp_pose.Pose(
-            min_detection_confidence=0.6, 
+        # 3. Initialize MediaPipe Tasks Pose Model
+        print("Loading MediaPipe Tasks Pose model...")
+        base_options = python.BaseOptions(model_asset_path=self.model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.6,
+            min_pose_presence_confidence=0.6,
             min_tracking_confidence=0.6
         )
-        self.mp_draw = mp.solutions.drawing_utils
+        self.detector = vision.PoseLandmarker.create_from_options(options)
         
-        # 3. Tracking State Variables
+        # 4. Tracking State Variables
         self.target_locked = False
         self.first_seen_time = None
-        self.required_recognition_time = 2.0  # Seconds before moving
-        self.last_known_x = 0  # To track which way they went out of frame
+        self.required_recognition_time = 2.0  
+        self.last_known_x = 0  
         
-        # 4. Flight Tuning Parameters (Proportional Control)
-        self.p_yaw = 0.3      # Rotation speed multiplier
-        self.p_pitch = 0.3    # Forward/Back speed multiplier
-        self.p_throttle = 0.4 # Up/Down speed multiplier
+        # 5. Flight Tuning Parameters
+        # Increased p_yaw slightly so it turns fast enough to hold the orbit
+        self.p_yaw = 0.4      
+        self.p_pitch = 0.3    
+        self.p_throttle = 0.4 
+        self.orbit_speed = 35 # Speed of the circular strafe maneuver
         
-        # Target sizes for the bounding box (Area = Width * Height)
-        # Note: MediaPipe skeleton bounding boxes are tighter than YOLO boxes.
-        # You may need to reduce these numbers slightly if the drone flies too close.
         self.target_area = 80000 
-        self.area_range = [70000, 90000] # "Goldilocks" zone
+        self.area_range = [70000, 90000] 
 
     def connect_and_takeoff(self):
-        """Connects to the drone, starts the stream, and takes off."""
         self.tello.connect()
         print(f"Battery: {self.tello.get_battery()}%")
         
@@ -48,24 +70,22 @@ class TelloPersonTracker:
 
         self.tello.streamon()
         self.tello.takeoff()
-        self.tello.move_up(80) # Move to roughly chest/face height
+        self.tello.move_up(80) 
 
-    def get_person_bounding_box(self, results, w, h):
-        """Calculates a pseudo-bounding box from MediaPipe Pose landmarks."""
-        if not results.pose_landmarks:
+    def get_person_bounding_box(self, result, w, h):
+        """Calculates a pseudo-bounding box from the Tasks API landmarks."""
+        if not result.pose_landmarks:
             return None, 0
         
-        # Extract X and Y coordinates of all 33 skeleton joints
-        x_coords = [lm.x for lm in results.pose_landmarks.landmark]
-        y_coords = [lm.y for lm in results.pose_landmarks.landmark]
+        landmarks = result.pose_landmarks[0]
+        x_coords = [lm.x for lm in landmarks]
+        y_coords = [lm.y for lm in landmarks]
         
-        # Find the outer edges of the person
         x1 = int(min(x_coords) * w)
         y1 = int(min(y_coords) * h)
         x2 = int(max(x_coords) * w)
         y2 = int(max(y_coords) * h)
         
-        # Clamp values to frame boundaries to prevent off-screen window errors
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         
@@ -76,7 +96,6 @@ class TelloPersonTracker:
         return (x1, y1, bw, bh), area
 
     def track(self):
-        """Main tracking loop."""
         print("Starting tracking loop. Press 'q' in the video window to quit & land.")
         
         try:
@@ -89,14 +108,15 @@ class TelloPersonTracker:
                 center_x, center_y = w // 2, h // 2
 
                 # 2. Run Inference
-                # MediaPipe requires RGB format, OpenCV defaults to BGR
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = self.pose.process(rgb_frame)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                timestamp_ms = int(time.time() * 1000)
+                
+                results = self.detector.detect_for_video(mp_image, timestamp_ms)
                 
                 # 3. Find our target
                 person_box, area = self.get_person_bounding_box(results, w, h)
 
-                # Default speeds (Hover)
                 left_right, forward_backward, up_down, yaw = 0, 0, 0, 0
 
                 if person_box is not None:
@@ -107,12 +127,9 @@ class TelloPersonTracker:
                     
                     self.last_known_x = obj_cx
 
-                    # Draw the bounding box and the skeleton
                     cv2.rectangle(frame, (x1, y1), (x1 + bw, y1 + bh), (0, 255, 0), 2)
                     cv2.circle(frame, (obj_cx, obj_cy), 5, (0, 0, 255), cv2.FILLED)
-                    self.mp_draw.draw_landmarks(frame, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
-                    # Handle 2-second recognition logic
                     if self.first_seen_time is None:
                         self.first_seen_time = time.time()
                         cv2.putText(frame, "Recognizing...", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
@@ -121,17 +138,24 @@ class TelloPersonTracker:
                         self.target_locked = True
                         cv2.putText(frame, "TARGET LOCKED", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                         
-                        # --- CALCULATE MOVEMENT ---
+                        # Calculate center tracking 
                         error_x = obj_cx - center_x
                         error_y = obj_cy - center_y
 
                         yaw = int(error_x * self.p_yaw)
                         up_down = int(-error_y * self.p_throttle)
 
-                        if area > self.area_range[1]:      # Too close, move back
-                            forward_backward = -20
-                        elif area < self.area_range[0]:    # Too far, move forward
-                            forward_backward = 20
+                        # Distance logic & Orbit trigger
+                        if area > self.area_range[1]:      
+                            forward_backward = -20  # Move back
+                            left_right = 0          # Stop orbiting while adjusting distance
+                        elif area < self.area_range[0]:    
+                            forward_backward = 20   # Move forward
+                            left_right = 0          # Stop orbiting while adjusting distance
+                        else:
+                            # Distance is perfect. INITIATE ORBIT!
+                            left_right = self.orbit_speed 
+                            cv2.putText(frame, "ORBITING...", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
 
                 else:
                     # --- PERSON LOST ---
@@ -139,21 +163,22 @@ class TelloPersonTracker:
                     self.first_seen_time = None
                     cv2.putText(frame, "SEARCHING...", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                     
-                    # Search logic: Rotate in the direction they were last seen
                     if self.last_known_x < center_x:
-                        yaw = -30 # Rotate Left
+                        yaw = -30 
                     elif self.last_known_x > center_x:
-                        yaw = 30  # Rotate Right
+                        yaw = 30  
                     else:
-                        yaw = 0   # Hover if we have no data
+                        yaw = 0   
 
-                # 4. Clamp speeds to safe Tello limits (-100 to 100)
+                # 4. Clamp speeds to safe Tello limits
                 yaw = max(-100, min(100, yaw))
                 up_down = max(-100, min(100, up_down))
                 forward_backward = max(-100, min(100, forward_backward))
+                left_right = max(-100, min(100, left_right))
 
                 # 5. Send Commands
-                self.tello.send_rc_control(0, forward_backward, up_down, yaw)
+                # Format: left_right, forward_backward, up_down, yaw
+                self.tello.send_rc_control(left_right, forward_backward, up_down, yaw)
 
                 # 6. Display Video
                 cv2.imshow("Tello Tracker", frame)
@@ -169,7 +194,7 @@ class TelloPersonTracker:
             self.tello.send_rc_control(0, 0, 0, 0)
             self.tello.land()
             self.tello.streamoff()
-            self.pose.close() # Free MediaPipe resources
+            self.detector.close() 
             cv2.destroyAllWindows()
 
 if __name__ == "__main__":

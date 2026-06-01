@@ -1,42 +1,66 @@
-# MediaPipe Person Tracker & 360 Vertical Search for DJI Tello Drone
+# MediaPipe Tasks API Person Tracker & Two-Phase 360 Search for DJI Tello
 
 import cv2
 import time
+import urllib.request
+import os
 from djitellopy import Tello
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 class TelloPersonTracker:
     def __init__(self):
-        # 1. Initialize Drone
+# --- 1. MODEL DOWNLOAD CHECK ---
+        # The new API requires a physical model file
+        self.model_path = 'pose_landmarker_lite.task'
+        if not os.path.exists(self.model_path):
+            print(f"Model file missing. Attempting to download {self.model_path}...")
+            try:
+                url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+                urllib.request.urlretrieve(url, self.model_path)
+                print("Download complete!")
+            except Exception as e:
+                print("\n" + "="*50)
+                print("[ERROR] Could not download the MediaPipe model.")
+                print("Your computer likely has no internet connection because it is connected to the Tello drone.")
+                print("-> FIX: Disconnect from Tello, connect to your normal Wi-Fi, run this script once to download the file, then reconnect to the Tello.")
+                print("="*50 + "\n")
+                exit()
+
+        # 2. Initialize Drone
         self.tello = Tello()
         
-        # 2. Initialize MediaPipe Pose Model
-        print("Loading MediaPipe Pose model...")
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            min_detection_confidence=0.6, 
+        # 3. Initialize MediaPipe Tasks Pose Model
+        print("Loading MediaPipe Tasks Pose model...")
+        base_options = python.BaseOptions(model_asset_path=self.model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1, # Limit to tracking 1 person
+            min_pose_detection_confidence=0.6,
+            min_pose_presence_confidence=0.6,
             min_tracking_confidence=0.6
         )
-        self.mp_draw = mp.solutions.drawing_utils
+        self.detector = vision.PoseLandmarker.create_from_options(options)
         
-        # 3. Tracking State Variables
+        # 4. Tracking State Variables
         self.target_locked = False
         self.first_seen_time = None
-        self.required_recognition_time = 2.0  # Seconds before moving
+        self.required_recognition_time = 2.0  
+        self.last_known_x = 0  
         
-        # 4. Flight Tuning Parameters (Proportional Control)
+        # 5. Flight Tuning Parameters
         self.p_yaw = 0.3      
         self.p_pitch = 0.3    
         self.p_throttle = 0.4 
-        
-        # Note: MediaPipe bounding boxes are tighter to the body than YOLO.
-        # You may need to tune these area targets down slightly during testing.
         self.target_area = 80000 
         self.area_range = [70000, 90000] 
 
-        # 5. Autonomous Search Pattern Variables
-        self.search_state = "ROTATE"   # States: ROTATE, DOWN, UP, DOWN_CENTER
-        self.search_step_start = None  # Tracks how long we've been in the current state
+        # 6. Autonomous Search Pattern Variables
+        self.time_target_lost = None
+        self.search_state = "ROTATE"   
+        self.search_step_start = None  
 
     def connect_and_takeoff(self):
         """Connects to the drone, starts the stream, and takes off."""
@@ -49,24 +73,24 @@ class TelloPersonTracker:
 
         self.tello.streamon()
         self.tello.takeoff()
-        self.tello.move_up(80) # Move to roughly chest/face height
+        self.tello.move_up(80) 
 
-    def get_person_bounding_box(self, results, w, h):
-        """Calculates a bounding box from MediaPipe Pose landmarks."""
-        if not results.pose_landmarks:
+    def get_person_bounding_box(self, result, w, h):
+        """Calculates a bounding box from the new Tasks API landmarks."""
+        if not result.pose_landmarks:
             return None, 0
         
-        # Extract X and Y coordinates of all 33 landmarks
-        x_coords = [lm.x for lm in results.pose_landmarks.landmark]
-        y_coords = [lm.y for lm in results.pose_landmarks.landmark]
+        # Extract the skeleton joints of the first person detected
+        landmarks = result.pose_landmarks[0]
         
-        # Find the edges of the person
+        x_coords = [lm.x for lm in landmarks]
+        y_coords = [lm.y for lm in landmarks]
+        
         x1 = int(min(x_coords) * w)
         y1 = int(min(y_coords) * h)
         x2 = int(max(x_coords) * w)
         y2 = int(max(y_coords) * h)
         
-        # Clamp values to frame boundaries to prevent crashing
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         
@@ -89,32 +113,33 @@ class TelloPersonTracker:
                 h, w, _ = frame.shape
                 center_x, center_y = w // 2, h // 2
 
-                # 2. Run Inference (MediaPipe requires RGB images)
+                # 2. Run Inference using Tasks API
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = self.pose.process(rgb_frame)
+                # The new API requires a specific MediaPipe Image object and a timestamp
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                timestamp_ms = int(time.time() * 1000)
+                
+                results = self.detector.detect_for_video(mp_image, timestamp_ms)
                 
                 # 3. Find our target
                 person_box, area = self.get_person_bounding_box(results, w, h)
 
-                # Default speeds (Hover)
                 left_right, forward_backward, up_down, yaw = 0, 0, 0, 0
 
                 if person_box is not None:
-                    # Reset search pattern timers because we found someone
+                    # Reset search timers
+                    self.time_target_lost = None
                     self.search_step_start = None
                     self.search_state = "ROTATE"
                     
-                    # --- PERSON DETECTED ---
                     x1, y1, bw, bh = person_box
                     obj_cx = x1 + (bw // 2)
                     obj_cy = y1 + (bh // 2)
+                    self.last_known_x = obj_cx
 
-                    # Draw the bounding box and the skeleton
                     cv2.rectangle(frame, (x1, y1), (x1 + bw, y1 + bh), (0, 255, 0), 2)
                     cv2.circle(frame, (obj_cx, obj_cy), 5, (0, 0, 255), cv2.FILLED)
-                    self.mp_draw.draw_landmarks(frame, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
-                    # Recognition Timer (Follow after 2 seconds)
                     if self.first_seen_time is None:
                         self.first_seen_time = time.time()
                         cv2.putText(frame, "Recognizing...", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
@@ -123,7 +148,6 @@ class TelloPersonTracker:
                         self.target_locked = True
                         cv2.putText(frame, "TARGET LOCKED", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                         
-                        # --- CALCULATE TRACKING MOVEMENT ---
                         error_x = obj_cx - center_x
                         error_y = obj_cy - center_y
 
@@ -134,55 +158,64 @@ class TelloPersonTracker:
                             forward_backward = -20
                         elif area < self.area_range[0]:    
                             forward_backward = 20
-
                 else:
-                    # --- PERSON LOST / SEARCH PATTERN ---
                     self.target_locked = False
                     self.first_seen_time = None
                     
-                    # Start the step timer for the search sequence
-                    if self.search_step_start is None:
-                        self.search_step_start = time.time()
+                    if self.time_target_lost is None:
+                        self.time_target_lost = time.time()
                         
-                    elapsed_time = time.time() - self.search_step_start
+                    time_lost = time.time() - self.time_target_lost
                     
-                    # Display Current Search State
-                    cv2.putText(frame, f"SEARCH: {self.search_state}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+                    # PHASE 1: Quick directional scan (4 seconds)
+                    if time_lost < 4.0:
+                        cv2.putText(frame, "PHASE 1: QUICK PAN", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                        if self.last_known_x < center_x:
+                            yaw = -30 
+                        elif self.last_known_x > center_x:
+                            yaw = 30  
+                        else:
+                            yaw = 0
+                            
+                    # PHASE 2: Deep 360 Vertical Search
+                    else:
+                        if self.search_step_start is None:
+                            self.search_step_start = time.time()
+                            
+                        elapsed_step_time = time.time() - self.search_step_start
+                        cv2.putText(frame, f"PHASE 2: 360 {self.search_state}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
 
-                    if self.search_state == "ROTATE":
-                        yaw = 45  # Spin Right
-                        # Adjust 6.0 based on your Tello's actual rotation speed to get a perfect 360
-                        if elapsed_time > 6.0:  
-                            self.search_state = "DOWN"
-                            self.search_step_start = time.time()
-                            
-                    elif self.search_state == "DOWN":
-                        up_down = -25 # Fly down
-                        if elapsed_time > 2.0: 
-                            self.search_state = "UP"
-                            self.search_step_start = time.time()
-                            
-                    elif self.search_state == "UP":
-                        up_down = 25 # Fly up (4 seconds to go back past start height to look high)
-                        if elapsed_time > 4.0:
-                            self.search_state = "DOWN_CENTER"
-                            self.search_step_start = time.time()
-                            
-                    elif self.search_state == "DOWN_CENTER":
-                        up_down = -25 # Fly down to return to original height
-                        if elapsed_time > 2.0:
-                            self.search_state = "ROTATE" # Loop back to spinning
-                            self.search_step_start = time.time()
+                        if self.search_state == "ROTATE":
+                            yaw = 45  
+                            if elapsed_step_time > 6.0:  
+                                self.search_state = "DOWN"
+                                self.search_step_start = time.time()
+                                
+                        elif self.search_state == "DOWN":
+                            up_down = -25 
+                            if elapsed_step_time > 2.0: 
+                                self.search_state = "UP"
+                                self.search_step_start = time.time()
+                                
+                        elif self.search_state == "UP":
+                            up_down = 25 
+                            if elapsed_step_time > 4.0:
+                                self.search_state = "DOWN_CENTER"
+                                self.search_step_start = time.time()
+                                
+                        elif self.search_state == "DOWN_CENTER":
+                            up_down = -25 
+                            if elapsed_step_time > 2.0:
+                                self.search_state = "ROTATE" 
+                                self.search_step_start = time.time()
 
-                # 4. Clamp speeds to safe Tello limits (-100 to 100)
+                # Clamp speeds and Send
                 yaw = max(-100, min(100, yaw))
                 up_down = max(-100, min(100, up_down))
                 forward_backward = max(-100, min(100, forward_backward))
-
-                # 5. Send Commands
+                
                 self.tello.send_rc_control(0, forward_backward, up_down, yaw)
 
-                # 6. Display Video
                 cv2.imshow("Tello Tracker", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -196,7 +229,7 @@ class TelloPersonTracker:
             self.tello.send_rc_control(0, 0, 0, 0)
             self.tello.land()
             self.tello.streamoff()
-            self.pose.close() # Free MediaPipe resources
+            self.detector.close() # Free memory
             cv2.destroyAllWindows()
 
 if __name__ == "__main__":
